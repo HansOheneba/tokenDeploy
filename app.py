@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, session
-from flask_mysqldb import MySQL
+import pymysql
 import bcrypt
 import uuid
 import os
@@ -7,7 +7,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 import pyffx
 import re
-from MySQLdb import IntegrityError
 import logging
 
 load_dotenv()
@@ -16,12 +15,12 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")  # Use an environment variable
 
 # MySQL Configuration
-app.config["MYSQL_HOST"] = os.getenv("MYSQL_HOST")
-app.config["MYSQL_USER"] = os.getenv("MYSQL_USER")
-app.config["MYSQL_PASSWORD"] = os.getenv("MYSQL_PASSWORD")
-app.config["MYSQL_DB"] = os.getenv("MYSQL_DB")
-
-mysql = MySQL(app)
+db_config = {
+    "host": os.getenv("MYSQL_HOST"),
+    "user": os.getenv("MYSQL_USER"),
+    "password": os.getenv("MYSQL_PASSWORD"),
+    "database": os.getenv("MYSQL_DB"),
+}
 
 # Secret key for encryption (should be securely stored)
 FPE_SECRET_KEY = os.getenv("FPE_SECRET_KEY", "secret_key")
@@ -37,14 +36,16 @@ def generate_token():
 
 # Function to log events
 def log_event(client_id, event_type, details):
-    cur = mysql.connection.cursor()
+    connection = pymysql.connect(**db_config)
+    cursor = connection.cursor()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute(
+    cursor.execute(
         "INSERT INTO logs (client_id, event_type, details, timestamp) VALUES (%s, %s, %s, %s)",
         (client_id, event_type, details, timestamp),
     )
-    mysql.connection.commit()
-    cur.close()
+    connection.commit()
+    cursor.close()
+    connection.close()
 
 
 # Hash Password
@@ -91,20 +92,23 @@ def login():
     client_id = data.get("client_id")
     password = data.get("password")
 
-    cur = mysql.connection.cursor()
-    cur.execute(
+    connection = pymysql.connect(**db_config)
+    cursor = connection.cursor()
+    cursor.execute(
         "SELECT id, password_hash FROM clients WHERE client_id = %s", (client_id,)
     )
-    user = cur.fetchone()
+    user = cursor.fetchone()
 
     if user and check_password(user[1], password):
         session["client_id"] = user[0]
         log_event(user[0], "login_success", "Client logged in successfully")
-        cur.close()
+        cursor.close()
+        connection.close()
         return jsonify({"message": "Login successful"})
 
     log_event(None, "failed_login", f"Failed login attempt for client_id: {client_id}")
-    cur.close()
+    cursor.close()
+    connection.close()
     return jsonify({"error": "Invalid credentials"}), 401
 
 
@@ -129,17 +133,19 @@ def tokenize():
     if not ghana_card_number or not phone_number:
         return jsonify({"error": "Missing required fields"}), 400
 
-    cur = mysql.connection.cursor()
+    connection = pymysql.connect(**db_config)
+    cursor = connection.cursor()
 
     # Check if user exists
     logging.debug("Checking if user exists")
-    cur.execute(
+    cursor.execute(
         "SELECT id FROM ghana_card_data WHERE ghana_card_number = %s AND phone_number = %s",
         (ghana_card_number, phone_number),
     )
-    result = cur.fetchone()
+    result = cursor.fetchone()
     if not result:
-        cur.close()
+        cursor.close()
+        connection.close()
         return jsonify({"error": "No matching record found for that input"}), 404
 
     ghana_card_id = result[0]
@@ -168,10 +174,10 @@ def tokenize():
     for field in fields:
         logging.debug(f"Processing field: {field}")
 
-        cur.execute(
+        cursor.execute(
             f"SELECT {field} FROM ghana_card_data WHERE id = %s", (ghana_card_id,)
         )
-        value_result = cur.fetchone()
+        value_result = cursor.fetchone()
         if not value_result or not value_result[0]:
             logging.warning(f"Field {field} is missing or empty in the database")
             tokens[field] = None  # If field doesn't exist, return null
@@ -189,12 +195,12 @@ def tokenize():
         # Store token in the database
         try:
             logging.debug(f"Inserting token for field: {field}")
-            cur.execute(
+            cursor.execute(
                 "INSERT INTO tokens (client_id, ghana_card_id, field_name, token, created_at) VALUES (%s, %s, %s, %s, %s)",
                 (client_id, ghana_card_id, field, token, datetime.now()),
             )
-            mysql.connection.commit()
-        except IntegrityError as e:
+            connection.commit()
+        except pymysql.IntegrityError as e:
             logging.error(f"Error inserting token for field {field}: {e}")
 
     log_event(
@@ -202,7 +208,8 @@ def tokenize():
         "tokenization_success",
         f"Client {client_id} successfully tokenized fields for Ghana Card {ghana_card_id}",
     )
-    cur.close()
+    cursor.close()
+    connection.close()
     return jsonify({"tokens": tokens}), 200
 
 
@@ -219,7 +226,8 @@ def detokenize():
     if not tokens:
         return jsonify({"error": "Missing required fields"}), 400
 
-    cur = mysql.connection.cursor()
+    connection = pymysql.connect(**db_config)
+    cursor = connection.cursor()
     original_values = {}
     unauthorized_fields = []
     unauthorized_client_ids = set()
@@ -229,11 +237,11 @@ def detokenize():
             original_values[field] = None
             continue
 
-        cur.execute(
+        cursor.execute(
             "SELECT client_id, ghana_card_id FROM tokens WHERE token = %s AND field_name = %s",
             (token, field),
         )
-        result = cur.fetchone()
+        result = cursor.fetchone()
         if not result or result[0] != client_id:
             unauthorized_fields.append(field)
             if result:
@@ -243,10 +251,10 @@ def detokenize():
         ghana_card_id = result[1]
 
         # Retrieve original value from ghana_card_data
-        cur.execute(
+        cursor.execute(
             f"SELECT {field} FROM ghana_card_data WHERE id = %s", (ghana_card_id,)
         )
-        original_value = cur.fetchone()
+        original_value = cursor.fetchone()
         if field == "date_of_birth" and original_value:
             original_values[field] = original_value[0].strftime("%Y-%m-%d")
         else:
@@ -259,7 +267,8 @@ def detokenize():
             "detokenization_failed",
             f"Client {client_id} attempted to detokenize fields that belong to client {unauthorized_client_ids_str}. Fields: {', '.join(unauthorized_fields)}.",
         )
-        cur.close()
+        cursor.close()
+        connection.close()
         return (
             jsonify({"error": "You are unauthorized to view this data"}),
             403,
@@ -270,7 +279,8 @@ def detokenize():
         "detokenization_success",
         f"Client {client_id} successfully detokenized fields for Ghana Card {ghana_card_id}",
     )
-    cur.close()
+    cursor.close()
+    connection.close()
     return jsonify(original_values), 200
 
 

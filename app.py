@@ -95,12 +95,14 @@ def login():
     connection = pymysql.connect(**db_config)
     cursor = connection.cursor()
     cursor.execute(
-        "SELECT id, password_hash FROM clients WHERE client_id = %s", (client_id,)
+        "SELECT id, password_hash, category_id FROM clients WHERE client_id = %s",
+        (client_id,),
     )
     user = cursor.fetchone()
 
     if user and check_password(user[1], password):
         session["client_id"] = user[0]
+        session["category_id"] = user[2]  # Store category in session
         log_event(user[0], "login_success", "Client logged in successfully")
         cursor.close()
         connection.close()
@@ -119,14 +121,15 @@ def logout():
     return jsonify({"message": "Logged out successfully"})
 
 
-# Tokenization Endpoint
+# Tokenize endpoint
 @app.route("/tokenize", methods=["POST"])
 def tokenize():
-    if "client_id" not in session:
+    if "client_id" not in session or "category_id" not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.json
     client_id = session["client_id"]
+    category_id = session["category_id"]
     ghana_card_number = data.get("ghana_card_number")
     phone_number = data.get("phone_number")
 
@@ -137,7 +140,6 @@ def tokenize():
     cursor = connection.cursor()
 
     # Check if user exists
-    logging.debug("Checking if user exists")
     cursor.execute(
         "SELECT id FROM ghana_card_data WHERE ghana_card_number = %s AND phone_number = %s",
         (ghana_card_number, phone_number),
@@ -146,62 +148,58 @@ def tokenize():
     if not result:
         cursor.close()
         connection.close()
-        return jsonify({"error": "No matching record found for that input"}), 404
+        return jsonify({"error": "No matching record found"}), 404
 
     ghana_card_id = result[0]
     tokens = {}
 
-    # List of all fields in the ghana_card_data table
-    fields = [
-        "ghana_card_number",
-        "first_name",
-        "middle_name",
-        "last_name",
-        "date_of_birth",
-        "place_of_birth",
-        "nationality",
-        "ethnicity",
-        "marital_status",
-        "mother_name",
-        "father_name",
-        "email",
-        "gender",
-        "address",
-        "phone_number",
-    ]
+    # Check if tokens already exist for this client and Ghana Card
+    cursor.execute(
+        "SELECT field_name, token FROM tokens WHERE client_id = %s AND ghana_card_id = %s",
+        (client_id, ghana_card_id),
+    )
+    existing_tokens = cursor.fetchall()
 
-    # Generate tokens for each field
-    for field in fields:
-        logging.debug(f"Processing field: {field}")
+    if existing_tokens:
+        # If tokens exist, return them
+        for field_name, token in existing_tokens:
+            tokens[field_name] = token
+        log_event(
+            client_id,
+            "tokenization_success",
+            f"Client {client_id} retrieved existing tokens for Ghana Card {ghana_card_id}",
+        )
+        cursor.close()
+        connection.close()
+        return jsonify({"tokens": tokens}), 200
 
+    # Retrieve allowed fields for this category
+    cursor.execute(
+        "SELECT field_name FROM category_permissions WHERE category_id = %s",
+        (category_id,),
+    )
+    allowed_fields = [row[0] for row in cursor.fetchall()]
+
+    # Generate tokens for allowed fields only
+    for field in allowed_fields:
         cursor.execute(
             f"SELECT {field} FROM ghana_card_data WHERE id = %s", (ghana_card_id,)
         )
         value_result = cursor.fetchone()
         if not value_result or not value_result[0]:
-            logging.warning(f"Field {field} is missing or empty in the database")
             tokens[field] = None  # If field doesn't exist, return null
             continue
 
         field_value = value_result[0]
-        logging.debug(f"Field {field} value: {field_value}")
-        try:
-            token = encrypt_value(field_value, client_id, field)
-            tokens[field] = token
-        except Exception as e:
-            logging.error(f"Error encrypting field {field}: {e}")
-            tokens[field] = None
+        token = encrypt_value(field_value, client_id, field)
+        tokens[field] = token
 
         # Store token in the database
-        try:
-            logging.debug(f"Inserting token for field: {field}")
-            cursor.execute(
-                "INSERT INTO tokens (client_id, ghana_card_id, field_name, token, created_at) VALUES (%s, %s, %s, %s, %s)",
-                (client_id, ghana_card_id, field, token, datetime.now()),
-            )
-            connection.commit()
-        except pymysql.IntegrityError as e:
-            logging.error(f"Error inserting token for field {field}: {e}")
+        cursor.execute(
+            "INSERT INTO tokens (client_id, ghana_card_id, field_name, token, created_at) VALUES (%s, %s, %s, %s, %s)",
+            (client_id, ghana_card_id, field, token, datetime.now()),
+        )
+        connection.commit()
 
     log_event(
         client_id,
@@ -213,14 +211,15 @@ def tokenize():
     return jsonify({"tokens": tokens}), 200
 
 
-# Detokenization Endpoint
+# Detokenize endpoint
 @app.route("/detokenize", methods=["POST"])
 def detokenize():
-    if "client_id" not in session:
+    if "client_id" not in session or "category_id" not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.json
     client_id = session["client_id"]
+    category_id = session["category_id"]
     tokens = data.get("tokens", {})
 
     if not tokens:
@@ -228,13 +227,24 @@ def detokenize():
 
     connection = pymysql.connect(**db_config)
     cursor = connection.cursor()
+
+    # Retrieve allowed fields for this category
+    cursor.execute(
+        "SELECT field_name FROM category_permissions WHERE category_id = %s",
+        (category_id,),
+    )
+    allowed_fields = {row[0] for row in cursor.fetchall()}
+
     original_values = {}
     unauthorized_fields = []
-    unauthorized_client_ids = set()
 
     for field, token in tokens.items():
         if not token:
             original_values[field] = None
+            continue
+
+        if field not in allowed_fields:
+            unauthorized_fields.append(field)
             continue
 
         cursor.execute(
@@ -244,33 +254,31 @@ def detokenize():
         result = cursor.fetchone()
         if not result or result[0] != client_id:
             unauthorized_fields.append(field)
-            if result:
-                unauthorized_client_ids.add(result[0])
             continue
 
         ghana_card_id = result[1]
 
-        # Retrieve original value from ghana_card_data
+        # Retrieve original value
         cursor.execute(
             f"SELECT {field} FROM ghana_card_data WHERE id = %s", (ghana_card_id,)
         )
         original_value = cursor.fetchone()
-        if field == "date_of_birth" and original_value:
-            original_values[field] = original_value[0].strftime("%Y-%m-%d")
-        else:
-            original_values[field] = original_value[0] if original_value else None
+        original_values[field] = (
+            original_value[0].strftime("%Y-%m-%d")
+            if field == "date_of_birth" and original_value
+            else original_value[0] if original_value else None
+        )
 
     if unauthorized_fields:
-        unauthorized_client_ids_str = ", ".join(map(str, unauthorized_client_ids))
         log_event(
             client_id,
             "detokenization_failed",
-            f"Client {client_id} attempted to detokenize fields that belong to client {unauthorized_client_ids_str}. Fields: {', '.join(unauthorized_fields)}.",
+            f"Client {client_id} attempted to detokenize unauthorized fields: {', '.join(unauthorized_fields)}",
         )
         cursor.close()
         connection.close()
         return (
-            jsonify({"error": "You are unauthorized to view this data"}),
+            jsonify({"error": "You are unauthorized to view some requested fields"}),
             403,
         )
 
@@ -285,4 +293,4 @@ def detokenize():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0", port=5002)

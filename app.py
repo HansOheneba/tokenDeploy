@@ -195,11 +195,16 @@ def tokenize():
         tokens[field] = token
 
         # Store token in the database
-        cursor.execute(
-            "INSERT INTO tokens (client_id, ghana_card_id, field_name, token, created_at) VALUES (%s, %s, %s, %s, %s)",
-            (client_id, ghana_card_id, field, token, datetime.now()),
-        )
-        connection.commit()
+        try:
+            cursor.execute(
+                "INSERT INTO tokens (client_id, ghana_card_id, field_name, token, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (client_id, ghana_card_id, field, token, datetime.now()),
+            )
+            connection.commit()
+        except pymysql.err.IntegrityError as e:
+            # If token already exists (unlikely since we checked earlier), skip insertion
+            connection.rollback()
+            continue
 
     log_event(
         client_id,
